@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/app/context/AuthContext';
@@ -9,6 +9,7 @@ import { parseChartData } from '@/lib/schemas/chartData';
 import Header from '@/app/components/Header';
 import TaskSidebar from './TaskSidebar';
 import Timeline from './Timeline';
+import SharePanel from './SharePanel';
 
 // Module-level singleton — stable reference, not recreated on every render
 const supabase = createClient();
@@ -21,18 +22,30 @@ export default function GanttEditorPage() {
   const { user } = useAuth();
   const router = useRouter();
 
-  const { loadChart, title, setTitle, tasks, isDirty, markClean } = useGanttStore();
+  const { loadChart, title, setTitle, tasks, isDirty, markClean, zoom, setZoom,
+          collaboratorRole, setCollaboratorRole, undo, redo } = useGanttStore();
+  const canEdit = collaboratorRole === 'owner' || collaboratorRole === 'editor';
+
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [notFound, setNotFound] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
 
-  // --- Fetch chart (race-condition safe via stale flag) ---
+  // Keep refs so Realtime handlers can read latest values without stale closures
+  const isDirtyRef = useRef(isDirty);
+  useEffect(() => { isDirtyRef.current = isDirty; }, [isDirty]);
+
+  const collaboratorRoleRef = useRef(collaboratorRole);
+  useEffect(() => { collaboratorRoleRef.current = collaboratorRole; }, [collaboratorRole]);
+
+  // --- Fetch chart: allow owner OR collaborator ---
   useEffect(() => {
     if (!user || !id) return;
     let stale = false;
 
     const fetchChart = async () => {
+      // RLS policy now allows owner + collaborators to SELECT
       const { data, error } = await supabase
         .from('gantt_charts')
         .select('id, title, chart_data, owner_id')
@@ -41,14 +54,38 @@ export default function GanttEditorPage() {
 
       if (stale) return;
 
-      if (error || !data || data.owner_id !== user.id) {
+      if (error || !data) {
         setNotFound(true);
         setLoading(false);
         return;
       }
 
-      // Validate chart_data at runtime — corrupt JSON becomes { tasks: [] }
+      // Determine role: owner or look up collaborator row
+      let role: 'owner' | 'editor' | 'viewer' = 'viewer';
+      if (data.owner_id === user.id) {
+        role = 'owner';
+      } else {
+        const { data: collab } = await supabase
+          .from('gantt_chart_collaborators')
+          .select('role')
+          .eq('chart_id', id)
+          .eq('user_id', user.id)
+          .single();
+
+        if (stale) return;
+
+        if (!collab) {
+          // No collaborator row — access denied
+          setNotFound(true);
+          setLoading(false);
+          return;
+        }
+        role = collab.role as 'editor' | 'viewer';
+      }
+
+      // loadChart resets collaboratorRole to null, so set role AFTER it
       loadChart(data.id, data.title, parseChartData(data.chart_data));
+      setCollaboratorRole(role);
       setLoading(false);
     };
 
@@ -57,9 +94,37 @@ export default function GanttEditorPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user, id]);
 
+  // --- Realtime: subscribe to remote changes from other editors ---
+  useEffect(() => {
+    if (!id || loading) return;
+
+    const channel = supabase
+      .channel(`chart-${id}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'gantt_charts', filter: `id=eq.${id}` },
+        (payload) => {
+          // Only apply remote update if we have no unsaved local changes
+          if (!isDirtyRef.current) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const row = payload.new as any;
+            loadChart(row.id, row.title, parseChartData(row.chart_data));
+            // loadChart resets collaboratorRole — restore it from the ref
+            if (collaboratorRoleRef.current) {
+              setCollaboratorRole(collaboratorRoleRef.current);
+            }
+          }
+        },
+      )
+      .subscribe();
+
+    return () => { supabase.removeChannel(channel); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, loading]);
+
   // --- Auto-save: 3-second debounce after any change ---
   useEffect(() => {
-    if (!isDirty || !id || !user) return;
+    if (!isDirty || !id || !user || !canEdit) return;
     setSaveStatus('pending');
 
     const timer = setTimeout(async () => {
@@ -73,8 +138,9 @@ export default function GanttEditorPage() {
           chart_data: { tasks },
           updated_at: new Date().toISOString(),
         })
-        .eq('id', id)
-        .eq('owner_id', user.id); // defense-in-depth on top of RLS
+        .eq('id', id);
+        // No .eq('owner_id') — editor collaborators also need to save.
+        // Defense-in-depth is handled by the DB UPDATE RLS policy.
 
       setSaving(false);
       if (!error) {
@@ -88,7 +154,49 @@ export default function GanttEditorPage() {
 
     return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isDirty, tasks, title, id, user]);
+  }, [isDirty, tasks, title, id, user, canEdit]);
+
+  // --- Undo / Redo keyboard shortcuts ---
+  useEffect(() => {
+    if (!canEdit) return;
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      // Don't intercept while typing in an input/textarea
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+      } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        redo();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [canEdit, undo, redo]);
+
+  // --- Save helper (used by both manual save and handleBack) ---
+  const saveNow = async () => {
+    if (!id || !user || !canEdit) return;
+    await supabase
+      .from('gantt_charts')
+      .update({ title, chart_data: { tasks }, updated_at: new Date().toISOString() })
+      .eq('id', id);
+    markClean();
+  };
+
+  // --- Back button: save → delete if empty/untitled → navigate ---
+  const handleBack = async () => {
+    if (canEdit) {
+      if (tasks.length === 0 && title.trim() === 'Untitled Gantt') {
+        // Empty chart — delete it silently
+        await supabase.from('gantt_charts').delete().eq('id', id);
+      } else if (isDirty) {
+        await saveNow();
+      }
+    }
+    router.push('/dashboard');
+  };
 
   // --- Warn before closing with unsaved changes ---
   useEffect(() => {
@@ -103,7 +211,7 @@ export default function GanttEditorPage() {
 
   // --- Manual save button ---
   const handleManualSave = async () => {
-    if (!id || !user || saving) return;
+    if (!id || !user || saving || !canEdit) return;
     setSaving(true);
     setSaveStatus('saving');
 
@@ -114,8 +222,7 @@ export default function GanttEditorPage() {
         chart_data: { tasks },
         updated_at: new Date().toISOString(),
       })
-      .eq('id', id)
-      .eq('owner_id', user.id);
+      .eq('id', id);
 
     setSaving(false);
     if (!error) {
@@ -173,23 +280,77 @@ export default function GanttEditorPage() {
 
       {/* Toolbar */}
       <div className="border-b border-gray-200 px-6 py-3 flex items-center gap-4 shrink-0">
+
+        {/* Back arrow */}
+        <button
+          onClick={handleBack}
+          className="text-gray-400 hover:text-gray-700 transition shrink-0 -ml-1"
+          title="Back to dashboard"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+
+      {/* Toolbar title — read only for viewers */}
         <input
           type="text"
           value={title}
-          onChange={(e) => setTitle(e.target.value)}
-          className="text-xl font-bold bg-transparent border-none outline-none flex-1 min-w-0"
+          onChange={(e) => canEdit && setTitle(e.target.value)}
+          readOnly={!canEdit}
+          className={`text-xl font-bold bg-transparent border-none outline-none flex-1 min-w-0 ${
+            !canEdit ? 'cursor-default select-none' : ''
+          }`}
           placeholder="Untitled Gantt"
         />
-        <span className={`text-xs shrink-0 ${statusColor[saveStatus]}`}>
-          {statusText[saveStatus]}
-        </span>
-        <button
-          onClick={handleManualSave}
-          disabled={!isDirty || saving}
-          className="bg-black text-white px-4 py-1.5 rounded text-sm font-semibold hover:bg-gray-800 disabled:opacity-40 transition shrink-0"
-        >
-          {saving ? 'Saving...' : 'Save'}
-        </button>
+
+        {/* Zoom toggle */}
+        <div className="flex items-center border border-gray-200 rounded overflow-hidden shrink-0">
+          {(['day', 'week', 'month'] as const).map((z) => (
+            <button
+              key={z}
+              onClick={() => setZoom(z)}
+              className={`px-3 py-1 text-xs font-medium transition capitalize ${
+                zoom === z ? 'bg-black text-white' : 'text-gray-500 hover:bg-gray-100'
+              }`}
+            >
+              {z}
+            </button>
+          ))}
+        </div>
+
+        {/* Viewer badge */}
+        {collaboratorRole === 'viewer' && (
+          <span className="text-xs text-gray-400 border border-gray-200 rounded px-2 py-0.5 shrink-0">
+            View only
+          </span>
+        )}
+
+        {canEdit && (
+          <span className={`text-xs shrink-0 ${statusColor[saveStatus]}`}>
+            {statusText[saveStatus]}
+          </span>
+        )}
+
+        {/* Share button — owner only */}
+        {collaboratorRole === 'owner' && (
+          <button
+            onClick={() => setShareOpen((o) => !o)}
+            className="border border-gray-200 text-gray-600 px-4 py-1.5 rounded text-sm font-medium hover:bg-gray-50 transition shrink-0"
+          >
+            Share
+          </button>
+        )}
+
+        {canEdit && (
+          <button
+            onClick={handleManualSave}
+            disabled={!isDirty || saving}
+            className="bg-black text-white px-4 py-1.5 rounded text-sm font-semibold hover:bg-gray-800 disabled:opacity-40 transition shrink-0"
+          >
+            {saving ? 'Saving...' : 'Save'}
+          </button>
+        )}
       </div>
 
       {/* Editor: sidebar + timeline */}
@@ -197,6 +358,11 @@ export default function GanttEditorPage() {
         <TaskSidebar />
         <Timeline />
       </div>
+
+      {/* Share panel slide-over */}
+      {shareOpen && (
+        <SharePanel chartId={id} onClose={() => setShareOpen(false)} />
+      )}
     </div>
   );
 }

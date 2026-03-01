@@ -1,8 +1,24 @@
 'use client';
 
 import { useState } from 'react';
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+  useSortable,
+  arrayMove,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 import { useGanttStore, Task } from '@/lib/stores/ganttStore';
-
 const TASK_COLORS = [
   '#000000',
   '#ff6b9d',
@@ -35,7 +51,25 @@ const defaultForm = (): TaskFormState => ({
 });
 
 export default function TaskSidebar() {
-  const { tasks, addTask, updateTask, deleteTask } = useGanttStore();
+  const { tasks, addTask, updateTask, deleteTask, reorderTasks, collaboratorRole } = useGanttStore();
+  const canEdit = collaboratorRole === 'owner' || collaboratorRole === 'editor';
+
+  // --- dnd-kit sensors ---
+  // PointerSensor with an activation distance prevents accidental drags on click
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = tasks.findIndex((t) => t.id === active.id);
+    const newIndex = tasks.findIndex((t) => t.id === over.id);
+    if (oldIndex !== -1 && newIndex !== -1) {
+      reorderTasks(arrayMove(tasks, oldIndex, newIndex));
+    }
+  };
 
   // Which task is selected (for editing)
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -86,17 +120,20 @@ export default function TaskSidebar() {
 
   return (
     <aside className="w-72 shrink-0 border-r border-gray-200 flex flex-col overflow-hidden">
-      <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
+      {/* Height matches Timeline HEADER_H = 56px so task rows stay aligned */}
+      <div className="h-14 px-4 shrink-0 border-b border-gray-100 flex items-center justify-between">
         <h3 className="text-sm font-semibold text-gray-600 uppercase tracking-wide">Tasks</h3>
-        <button
-          onClick={() => {
-            setAddOpen((o) => !o);
-            setSelectedId(null);
-          }}
-          className="text-sm bg-black text-white px-3 py-1 rounded hover:bg-gray-800 transition"
-        >
-          + Add
-        </button>
+        {canEdit && (
+          <button
+            onClick={() => {
+              setAddOpen((o) => !o);
+              setSelectedId(null);
+            }}
+            className="text-sm bg-black text-white px-3 py-1 rounded hover:bg-gray-800 transition"
+          >
+            + Add
+          </button>
+        )}
       </div>
 
       {/* Add task form */}
@@ -120,54 +157,115 @@ export default function TaskSidebar() {
           </p>
         )}
 
-        {tasks.map((task) => (
-          <div key={task.id}>
-            {/* Task row */}
-            <div
-              className={`flex items-center gap-2 px-4 py-2.5 cursor-pointer hover:bg-gray-50 transition group ${
-                selectedId === task.id ? 'bg-gray-100' : ''
-              }`}
-              onClick={() => handleSelectTask(task)}
-            >
-              {/* Color dot */}
-              <span
-                className="w-3 h-3 rounded-full shrink-0"
-                style={{ backgroundColor: task.color }}
+        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+          <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+            {tasks.map((task) => (
+              <SortableTaskRow
+                key={task.id}
+                task={task}
+                canEdit={canEdit}
+                isSelected={selectedId === task.id}
+                editForm={editForm}
+                onSelect={() => handleSelectTask(task)}
+                onDelete={() => handleDelete(task.id)}
+                onEditChange={setEditForm}
+                onSaveEdit={handleSaveEdit}
+                onCancelEdit={() => setSelectedId(null)}
               />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium truncate">{task.name}</p>
-                <p className="text-xs text-gray-400">
-                  {task.startDate} → {task.endDate}
-                </p>
-              </div>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  handleDelete(task.id);
-                }}
-                className="text-gray-300 hover:text-red-500 transition opacity-0 group-hover:opacity-100 shrink-0"
-                title="Delete task"
-              >
-                ×
-              </button>
-            </div>
-
-            {/* Inline edit form */}
-            {selectedId === task.id && (
-              <div className="px-4 py-3 bg-gray-50 border-b border-gray-100">
-                <TaskForm
-                  form={editForm}
-                  onChange={setEditForm}
-                  onSubmit={handleSaveEdit}
-                  onCancel={() => setSelectedId(null)}
-                  submitLabel="Save"
-                />
-              </div>
-            )}
-          </div>
-        ))}
+            ))}
+          </SortableContext>
+        </DndContext>
       </div>
     </aside>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Sortable task row — wraps the task display with dnd-kit drag-handle
+// ---------------------------------------------------------------------------
+function SortableTaskRow({
+  task,
+  canEdit,
+  isSelected,
+  editForm,
+  onSelect,
+  onDelete,
+  onEditChange,
+  onSaveEdit,
+  onCancelEdit,
+}: {
+  task: Task;
+  canEdit: boolean;
+  isSelected: boolean;
+  editForm: TaskFormState;
+  onSelect: () => void;
+  onDelete: () => void;
+  onEditChange: (f: TaskFormState) => void;
+  onSaveEdit: () => void;
+  onCancelEdit: () => void;
+}) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: task.id });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : 1,
+    zIndex: isDragging ? 999 : undefined,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style}>
+      {/* Task row — height matches Timeline ROW_H = 44px */}
+      <div
+        className={`flex items-center gap-2 px-4 h-11 shrink-0 hover:bg-gray-50 transition group ${
+          isSelected ? 'bg-gray-100' : ''
+        }`}
+        onClick={canEdit ? onSelect : undefined}
+        style={{ cursor: canEdit ? 'pointer' : 'default' }}
+      >
+        {/* Drag handle — only interactive for editors/owners */}
+        <span
+          {...attributes}
+          {...(canEdit ? listeners : {})}
+          onClick={(e) => e.stopPropagation()}
+          className={`shrink-0 select-none ${canEdit ? 'text-gray-300 hover:text-gray-500 cursor-grab active:cursor-grabbing' : 'text-gray-200 cursor-default'}`}
+          title={canEdit ? 'Drag to reorder' : undefined}
+        >
+          ⠿
+        </span>
+
+        {/* Color dot */}
+        <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: task.color }} />
+
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium truncate">{task.name}</p>
+          <p className="text-xs text-gray-400">{task.startDate} → {task.endDate}</p>
+        </div>
+
+        {canEdit && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+            className="text-gray-300 hover:text-red-500 transition opacity-0 group-hover:opacity-100 shrink-0"
+            title="Delete task"
+          >
+            ×
+          </button>
+        )}
+      </div>
+
+      {/* Inline edit form — shown only if user can edit */}
+      {isSelected && canEdit && (
+        <div className="px-4 py-3 bg-gray-50 border-b border-gray-100">
+          <TaskForm
+            form={editForm}
+            onChange={onEditChange}
+            onSubmit={onSaveEdit}
+            onCancel={onCancelEdit}
+            submitLabel="Save"
+          />
+        </div>
+      )}
+    </div>
   );
 }
 
