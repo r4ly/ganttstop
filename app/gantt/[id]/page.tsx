@@ -31,6 +31,7 @@ export default function GanttEditorPage() {
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   const [notFound, setNotFound] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
+  const [hasCollaborators, setHasCollaborators] = useState(false);
 
   // Keep refs so Realtime handlers can read latest values without stale closures
   const isDirtyRef = useRef(isDirty);
@@ -38,6 +39,28 @@ export default function GanttEditorPage() {
 
   const collaboratorRoleRef = useRef(collaboratorRole);
   useEffect(() => { collaboratorRoleRef.current = collaboratorRole; }, [collaboratorRole]);
+
+  // Track mutable values for the unmount cleanup below
+  const tasksRef = useRef(tasks);
+  useEffect(() => { tasksRef.current = tasks; }, [tasks]);
+  const titleRef = useRef(title);
+  useEffect(() => { titleRef.current = title; }, [title]);
+  const alreadyHandledRef = useRef(false); // set by handleBack to avoid double-delete
+
+  // Auto-delete empty+untitled charts when navigating away via Header links etc.
+  useEffect(() => {
+    return () => {
+      if (
+        !alreadyHandledRef.current &&
+        collaboratorRoleRef.current === 'owner' &&
+        tasksRef.current.length === 0 &&
+        titleRef.current.trim() === 'Untitled Gantt'
+      ) {
+        supabase.from('gantt_charts').delete().eq('id', id);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Fetch chart: allow owner OR collaborator ---
   useEffect(() => {
@@ -64,6 +87,12 @@ export default function GanttEditorPage() {
       let role: 'owner' | 'editor' | 'viewer' = 'viewer';
       if (data.owner_id === user.id) {
         role = 'owner';
+        // Check if chart has any collaborators (used to decide Realtime subscription)
+        const { count } = await supabase
+          .from('gantt_chart_collaborators')
+          .select('*', { count: 'exact', head: true })
+          .eq('chart_id', id);
+        if (!stale) setHasCollaborators((count ?? 0) > 0);
       } else {
         const { data: collab } = await supabase
           .from('gantt_chart_collaborators')
@@ -81,6 +110,7 @@ export default function GanttEditorPage() {
           return;
         }
         role = collab.role as 'editor' | 'viewer';
+        if (!stale) setHasCollaborators(true); // non-owners are themselves collaborators
       }
 
       // loadChart resets collaboratorRole to null, so set role AFTER it
@@ -97,6 +127,8 @@ export default function GanttEditorPage() {
   // --- Realtime: subscribe to remote changes from other editors ---
   useEffect(() => {
     if (!id || loading) return;
+    // Skip subscription for solo owners — no collaborators means no one else can change the chart
+    if (collaboratorRole === 'owner' && !hasCollaborators) return;
 
     const channel = supabase
       .channel(`chart-${id}`)
@@ -120,7 +152,7 @@ export default function GanttEditorPage() {
 
     return () => { supabase.removeChannel(channel); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id, loading]);
+  }, [id, loading, hasCollaborators, collaboratorRole]);
 
   // --- Auto-save: 3-second debounce after any change ---
   useEffect(() => {
@@ -176,23 +208,27 @@ export default function GanttEditorPage() {
   }, [canEdit, undo, redo]);
 
   // --- Save helper (used by both manual save and handleBack) ---
-  const saveNow = async () => {
-    if (!id || !user || !canEdit) return;
-    await supabase
+  const saveNow = async (): Promise<boolean> => {
+    if (!id || !user || !canEdit) return false;
+    const { error } = await supabase
       .from('gantt_charts')
       .update({ title, chart_data: { tasks }, updated_at: new Date().toISOString() })
       .eq('id', id);
-    markClean();
+    if (!error) markClean();
+    return !error;
   };
 
   // --- Back button: save → delete if empty/untitled → navigate ---
   const handleBack = async () => {
+    alreadyHandledRef.current = true; // prevent unmount effect from double-deleting
     if (canEdit) {
       if (tasks.length === 0 && title.trim() === 'Untitled Gantt') {
-        // Empty chart — delete it silently
+        // Mark clean first so the auto-save debounce doesn't fire on a deleted row
+        markClean();
         await supabase.from('gantt_charts').delete().eq('id', id);
       } else if (isDirty) {
-        await saveNow();
+        const saved = await saveNow();
+        if (!saved) return; // Don't navigate if save failed
       }
     }
     router.push('/dashboard');

@@ -5,7 +5,7 @@ import Link from 'next/link';
 import { useAuth } from '../context/AuthContext';
 
 export default function Header() {
-  const { user, signOut } = useAuth();
+  const { user } = useAuth();
 
   return (
     <header className="bg-black text-white h-32 px-3">
@@ -28,7 +28,7 @@ export default function Header() {
           <Link href="/" className="hover:opacity-70 transition">
             <Image src="/home.png" alt="HOME" width={70} height={25} className="object-contain" />
           </Link>
-          <Link href="/my-gantts" className="hover:opacity-70 transition">
+          <Link href="/dashboard" className="hover:opacity-70 transition">
             <Image src="/my-gantts.png" alt="MY GANTTS" width={120} height={25} className="object-contain" />
           </Link>
           <Link href="/customization" className="hover:opacity-70 transition">
@@ -52,12 +52,6 @@ export default function Header() {
                   className="rounded-full object-cover hover:opacity-80 transition"
                 />
               </Link>
-              <button
-                onClick={signOut}
-                className="text-sm text-white hover:opacity-70 transition"
-              >
-                Sign Out
-              </button>
             </div>
           ) : (
             <Link

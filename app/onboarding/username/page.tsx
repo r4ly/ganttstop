@@ -3,14 +3,18 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
+import { useAuth } from '@/app/context/AuthContext';
 import Image from 'next/image';
+
+// Module-level singleton — matches convention in all other files
+const supabase = createClient();
 
 export default function SetUsername() {
   const [username, setUsername] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const router = useRouter();
-  const supabase = createClient();
+  const { refreshProfile } = useAuth();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -28,20 +32,22 @@ export default function SetUsername() {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) throw new Error('Not authenticated');
 
-      const { error: updateError } = await supabase
+      // upsert is safer than update — works even if the trigger hasn't fired yet
+      const { error: upsertError } = await supabase
         .from('profiles')
-        .update({ username })
-        .eq('id', user.id);
+        .upsert({ id: user.id, username });
 
-      if (updateError) {
-        if (updateError.code === '23505') {
+      if (upsertError) {
+        if (upsertError.code === '23505') {
           setError('That username is already taken. Please choose another.');
         } else {
-          throw updateError;
+          throw upsertError;
         }
         return;
       }
 
+      // Refresh AuthContext so username shows immediately without a hard reload
+      await refreshProfile();
       router.push('/dashboard');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');

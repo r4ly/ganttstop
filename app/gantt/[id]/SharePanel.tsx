@@ -94,7 +94,15 @@ export default function SharePanel({ chartId, onClose }: Props) {
       return;
     }
 
-    // 2. Check they're not already a collaborator
+    // 2. Check they're not the current user (can't invite yourself)
+    const { data: me } = await supabase.auth.getUser();
+    if (profile.id === me?.user?.id) {
+      setInviteError("You can't invite yourself.");
+      setInviting(false);
+      return;
+    }
+
+    // 3. Check they're not already a collaborator
     const already = collaborators.some((c) => c.user_id === profile.id);
     if (already) {
       setInviteError(`${uname} is already a collaborator`);
@@ -102,8 +110,7 @@ export default function SharePanel({ chartId, onClose }: Props) {
       return;
     }
 
-    // 3. Insert the collaborator row — RLS ensures only the chart owner can do this
-    const { data: me } = await supabase.auth.getUser();
+    // 4. Insert the collaborator row — RLS ensures only the chart owner can do this
     const { error: insertErr } = await supabase.from('gantt_chart_collaborators').insert({
       chart_id: chartId,
       user_id: profile.id,

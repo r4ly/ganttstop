@@ -11,11 +11,23 @@ import Header from '../components/Header';
 // Module-level client — stable across renders, removes it from useEffect deps
 const supabase = createClient();
 
+interface MiniTask {
+  startDate?: string;
+  endDate?: string;
+  bars?: { startDate: string; endDate: string }[];
+  color: string;
+}
+
 interface GanttChart {
   id: string;
   title: string;
   updated_at: string;
   created_at: string;
+  chart_data?: { tasks: MiniTask[] };
+}
+
+interface SharedChartWithData extends SharedChart {
+  chart_data?: { tasks: MiniTask[] };
 }
 
 interface SharedChart {
@@ -43,7 +55,7 @@ export default function Dashboard() {
       // ---- Owned charts ----
       const { data: ownedData, error: ownedErr } = await supabase
         .from('gantt_charts')
-        .select('id, title, updated_at, created_at')
+        .select('id, title, updated_at, created_at, chart_data')
         .eq('owner_id', user.id)
         .order('updated_at', { ascending: false });
 
@@ -60,7 +72,7 @@ export default function Dashboard() {
 
         const { data: sharedData } = await supabase
           .from('gantt_charts')
-          .select('id, title, updated_at, owner_id')
+          .select('id, title, updated_at, owner_id, chart_data')
           .in('id', chartIds);
 
         if (sharedData) {
@@ -77,17 +89,18 @@ export default function Dashboard() {
             collabData.map((c) => [c.chart_id, c.role]),
           );
 
-          const mapped: SharedChart[] = sharedData
+          const mapped: SharedChartWithData[] = sharedData
             .map((c) => ({
               id: c.id,
               title: c.title,
               updated_at: c.updated_at,
               role: roleMap[c.id] as 'editor' | 'viewer',
               owner_username: profileMap[c.owner_id] ?? 'unknown',
+              chart_data: c.chart_data,
             }))
             .sort((a, b) => new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime());
 
-          setSharedCharts(mapped);
+          setSharedCharts(mapped as SharedChart[]);
         }
       }
 
@@ -125,7 +138,16 @@ export default function Dashboard() {
     const confirmed = window.confirm('Delete this gantt chart? This cannot be undone.');
     if (!confirmed) return;
 
-    await supabase.from('gantt_charts').delete().eq('id', id).eq('owner_id', user?.id ?? '');
+    const { error } = await supabase
+      .from('gantt_charts')
+      .delete()
+      .eq('id', id)
+      .eq('owner_id', user?.id ?? '');
+
+    if (error) {
+      console.error('Failed to delete chart:', error.message);
+      return;
+    }
     setCharts((prev) => prev.filter((c) => c.id !== id));
   };
 
@@ -166,20 +188,15 @@ export default function Dashboard() {
         {!loading && sharedCharts.length > 0 && (
           <section className="mt-14">
             <h2 className="text-xl font-bold mb-6">Shared with me</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
               {sharedCharts.map((chart) => (
                 <Link
                   key={chart.id}
                   href={`/gantt/${chart.id}`}
-                  className="border border-gray-200 rounded-xl p-5 hover:border-gray-400 transition block"
+                  className="border border-gray-200 rounded-xl p-4 hover:border-gray-400 transition block flex flex-col"
                 >
-                  {/* Mini preview */}
-                  <div className="h-12 bg-gray-50 rounded-md mb-4 flex items-center gap-1 px-2 overflow-hidden">
-                    <div className="h-3 bg-black rounded-sm opacity-20 w-1/3" />
-                    <div className="h-3 bg-black rounded-sm opacity-20 w-1/4 ml-3" />
-                    <div className="h-3 bg-black rounded-sm opacity-20 w-1/5 ml-2" />
-                  </div>
-                  <h3 className="font-semibold text-base truncate">{chart.title}</h3>
+                  <MiniGantt tasks={(chart as SharedChartWithData).chart_data?.tasks ?? []} />
+                  <h3 className="font-semibold text-sm truncate">{chart.title}</h3>
                   <p className="text-xs text-gray-400 mt-1">
                     Updated {formatDistanceToNow(new Date(chart.updated_at), { addSuffix: true })}
                   </p>
@@ -204,6 +221,75 @@ export default function Dashboard() {
 }
 
 // ---------------------------------------------------------------------------
+// Mini Gantt preview component — renders real colored bars from chart_data
+// ---------------------------------------------------------------------------
+function MiniGantt({ tasks }: { tasks: MiniTask[] }) {
+  // Flatten bars from both old format (startDate/endDate) and new (bars[])
+  const allBars: { startDate: string; endDate: string; color: string }[] = tasks.flatMap((t) => {
+    if (t.bars && t.bars.length > 0) {
+      return t.bars.map((b) => ({ startDate: b.startDate, endDate: b.endDate, color: t.color }));
+    }
+    if (t.startDate && t.endDate) {
+      return [{ startDate: t.startDate, endDate: t.endDate, color: t.color }];
+    }
+    return [];
+  });
+
+  const PREVIEW_H = 120; // usable px inside container
+  const BAR_GAP   = 3;
+  const MIN_BAR_H = 3;
+  const MAX_BAR_H = 10;
+
+  if (allBars.length === 0) {
+    return (
+      <div className="h-32 bg-gray-100 rounded-md mb-3 flex items-center gap-1 px-2 overflow-hidden">
+        <div className="h-2 bg-gray-300 rounded-sm w-1/3" />
+        <div className="h-2 bg-gray-300 rounded-sm w-1/4 ml-3" />
+        <div className="h-2 bg-gray-300 rounded-sm w-1/5 ml-2" />
+      </div>
+    );
+  }
+
+  const toMs = (d: string) => new Date(d).getTime();
+  const minTime = Math.min(...allBars.map((b) => toMs(b.startDate)));
+  const maxTime = Math.max(...allBars.map((b) => toMs(b.endDate)));
+  const totalMs = maxTime - minTime || 1;
+
+  // Adaptive bar height: shrink to fit, but never below MIN_BAR_H
+  const n      = allBars.length;
+  const target = Math.floor((PREVIEW_H - (n - 1) * BAR_GAP) / n);
+  const barH   = Math.max(MIN_BAR_H, Math.min(MAX_BAR_H, target));
+  // Max bars that physically fit at this height
+  const maxBars   = Math.floor((PREVIEW_H + BAR_GAP) / (barH + BAR_GAP));
+  const visible   = allBars.slice(0, maxBars);
+
+  return (
+    <div className="h-32 bg-gray-100 rounded-md mb-3 relative overflow-hidden">
+      {visible.map((bar, i) => {
+        const left  = ((toMs(bar.startDate) - minTime) / totalMs) * 100;
+        const width = Math.max(2, ((toMs(bar.endDate) - toMs(bar.startDate)) / totalMs) * 100);
+        const top   = 4 + i * (barH + BAR_GAP);
+        return (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              left:   `${left}%`,
+              width:  `${width}%`,
+              top,
+              height: barH,
+              backgroundColor: bar.color,
+              borderRadius: 2,
+              opacity: 0.85,
+            }}
+          />
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Owned-chart grid (extracted so it stays readable)
 // ---------------------------------------------------------------------------
 function ChartGrid({
@@ -214,20 +300,15 @@ function ChartGrid({
   onDelete: (id: string) => void;
 }) {
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-5">
+    <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-4">
       {charts.map((chart) => (
         <div
           key={chart.id}
-          className="border border-gray-200 rounded-xl p-5 hover:border-gray-400 transition group relative"
+          className="border border-gray-200 rounded-xl p-4 hover:border-gray-400 transition group relative flex flex-col"
         >
-          <Link href={`/gantt/${chart.id}`} className="block">
-            {/* Mini preview bar strip */}
-            <div className="h-12 bg-gray-50 rounded-md mb-4 flex items-center gap-1 px-2 overflow-hidden">
-              <div className="h-3 bg-black rounded-sm opacity-20 w-1/3" />
-              <div className="h-3 bg-black rounded-sm opacity-20 w-1/4 ml-3" />
-              <div className="h-3 bg-black rounded-sm opacity-20 w-1/5 ml-2" />
-            </div>
-            <h3 className="font-semibold text-base truncate">{chart.title}</h3>
+          <Link href={`/gantt/${chart.id}`} className="block flex-1">
+            <MiniGantt tasks={chart.chart_data?.tasks ?? []} />
+            <h3 className="font-semibold text-sm truncate">{chart.title}</h3>
             <p className="text-xs text-gray-400 mt-1">
               Updated {formatDistanceToNow(new Date(chart.updated_at), { addSuffix: true })}
             </p>

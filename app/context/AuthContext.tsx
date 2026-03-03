@@ -13,6 +13,7 @@ interface AuthContextType {
   username: string | null;
   loading: boolean;
   signOut: () => Promise<void>;
+  refreshProfile: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -23,6 +24,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true);
   const router = useRouter();
 
+  const fetchProfile = async (userId: string) => {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('username')
+      .eq('id', userId)
+      .single();
+    setUsername(profile?.username ?? null);
+  };
+
   useEffect(() => {
     // Fetch session, then profile — both before marking loading:false
     const init = async () => {
@@ -31,12 +41,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setUser(authedUser);
 
       if (authedUser) {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('username')
-          .eq('id', authedUser.id)
-          .single();
-        setUsername(profile?.username ?? null);
+        await fetchProfile(authedUser.id);
       }
 
       setLoading(false);
@@ -53,15 +58,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => subscription?.unsubscribe();
   }, []);
 
+  const refreshProfile = async () => {
+    const { data: { user: currentUser } } = await supabase.auth.getUser();
+    if (currentUser) await fetchProfile(currentUser.id);
+  };
+
   const signOut = async () => {
     await supabase.auth.signOut();
     setUser(null);
     setUsername(null);
+    // Clear the "has username" proxy cache cookie
+    document.cookie = 'gs_hun=; path=/; max-age=0; sameSite=strict';
     router.push('/');
   };
 
   return (
-    <AuthContext.Provider value={{ user, username, loading, signOut }}>
+    <AuthContext.Provider value={{ user, username, loading, signOut, refreshProfile }}>
       {children}
     </AuthContext.Provider>
   );
